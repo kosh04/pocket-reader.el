@@ -223,14 +223,6 @@ preferred (e.g. if you prefer not to load AMP URLs for Reddit)."
   :type '(alist :key-type symbol
                 :value-type (repeat string)))
 
-(defcustom pocket-reader-finalize-hook
-  '(pocket-reader--apply-faces
-    pocket-reader--add-spacers)
-  "Functions run after printing items into the buffer."
-  :type 'hook
-  :options '(pocket-reader--apply-faces
-             pocket-reader--add-spacers))
-
 (defcustom pocket-reader-url-priorities
   '(amp_url resolved_url given_url)
   "URLs for each item are chosen in this order.
@@ -311,22 +303,11 @@ get the `item-id' from it."
 (define-derived-mode pocket-reader-mode tabulated-list-mode
   "Pocket Reader"
   :group 'pocket-reader
-
-  ;; FIXME: Unfortunately I can't get (local 'symbol) to work with
-  ;; `advice-add', and I can't get `add-function' to work either, so I
-  ;; have to use `advice-add', test the buffer each time the advice is
-  ;; called, and delete the advice manually when the buffer is killed.
-  (advice-add 'tabulated-list--sort-by-column-name :after 'pocket-reader--finalize)
-  (add-hook 'kill-buffer-hook (lambda ()
-                                (advice-remove 'tabulated-list--sort-by-column-name 'pocket-reader--finalize))
-            'append 'local)
-
-  (setq tabulated-list-sort-key '("Added" . nil))
+  ;; putting most recent items on top
+  (setq tabulated-list-sort-key '("Added" . t))
   (setq pocket-reader-queries pocket-reader-default-queries)
   (pocket-reader-refresh)
-  (unless (cdr tabulated-list-sort-key)
-    ;; Invert initial sort order, putting most recent items on top
-    (tabulated-list-sort 0)))
+  )
 
 ;;;; Functions
 
@@ -574,11 +555,12 @@ other special keywords."
            (item (ht-get pocket-reader-items id))
            (url (pocket-reader--get-url item))
            (fn (or fn (pocket-reader--map-url-open-fn url))))
-      (when (funcall fn url)
+      (when (and (funcall fn url) pocket-reader-archive-on-open)
         ;; Item opened successfully
-        (when pocket-reader-archive-on-open
-          (pocket-reader--with-pocket-reader-buffer
-            (pocket-reader--archive-items (pocket-reader--current-item))))))))
+        ;; (when pocket-reader-archive-on-open
+        ;;   (pocket-reader--with-pocket-reader-buffer
+        ;;     (pocket-reader--archive-items (pocket-reader--current-item))))
+        ))))
 
 (defun pocket-reader-pop-to-url ()
   "Open URL of current item with default pop-to function."
@@ -697,7 +679,7 @@ of which is chosen as configured by
 
   (tabulated-list-init-header)
   (tabulated-list-print 'remember-pos)
-  (pocket-reader--finalize))
+  )
 
 (defun pocket-reader--items-to-tabulated-list-entries (items)
   "Convert ITEMS to a list of vectors of lists, suitable for `tabulated-list-entries'."
@@ -723,19 +705,29 @@ of which is chosen as configured by
   ;;
   ;;   There should be no newlines in any of these strings.
   (cl-loop for it being the hash-values of items
-           collect (let ((id (string-to-number (ht-get it 'item_id)))
-                         (added (pocket-reader--format-timestamp (string-to-number (ht-get it 'time_added))))
-                         (favorite (pocket-reader--favorite-string (ht-get it 'favorite)))
-                         (title (pocket-reader--not-empty-string (pocket-reader--or-string-not-blank
-                                                                  (ht-get it 'resolved_title)
-                                                                  (ht-get it 'given_title)
-                                                                  "[untitled]")))
-                         (domain (pocket-reader--url-domain
-                                  ;; Don't use --get-url here, because, e.g. we don't want an "amp." to be shown in the list
-                                  (pocket-reader--or-string-not-blank (ht-get it 'resolved_url)
-                                                                      (ht-get it 'given_url))))
-                         (tags (pocket-reader--not-empty-string (s-join "," (ht-get it 'tags)))))
-                     (list id (vector added favorite title domain tags)))))
+           collect (let* ((id (string-to-number (ht-get it 'item_id)))
+                          (archived (gethash 'status it))
+                          (added (pocket-reader--format-timestamp (string-to-number (ht-get it 'time_added))))
+                          (favorite (pocket-reader--favorite-string (ht-get it 'favorite)))
+                          (title (pocket-reader--or-string-not-blank
+                                  (ht-get it 'resolved_title)
+                                  (ht-get it 'given_title)
+                                  "[untitled]"))
+                          (domain (pocket-reader--url-domain
+                                   ;; Don't use --get-url here, because, e.g. we don't want an "amp." to be shown in the list
+                                   (pocket-reader--or-string-not-blank (ht-get it 'resolved_url)
+                                                          (ht-get it 'given_url))))
+                          ;;(tags (pocket-reader--not-empty-string (s-join "," (ht-get it 'tags))))
+                          (tags (s-join "," (ht-get it 'tags)))
+                          (color (when (or pocket-reader-color-site
+                                           pocket-reader-color-title)
+                                   (rainbow-identifiers-cie-l*a*b*-choose-face
+                                    (rainbow-identifiers--hash-function domain)))))
+                     (when pocket-reader-color-site
+                       (setq domain (propertize domain 'face color)))
+                     (when pocket-reader-color-title
+                       (setq title (propertize title 'face color)))
+                     (list id (vector archived added favorite title domain tags)))))
 
 (defun pocket-reader--delete-items (&rest items)
   "Delete ITEMS.
@@ -755,15 +747,6 @@ Items should be a list of items as returned by
     ;; `cl-delete' instead of rebuilding it from scratch?  Or is it
     ;; better, safer, to do this?
     (setq tabulated-list-entries (pocket-reader--items-to-tabulated-list-entries pocket-reader-items))))
-
-(defun pocket-reader--finalize (&rest _)
-  "Finalize the buffer after adding or sorting items."
-  ;; Because we have to add this function as advice to
-  ;; `tabulated-list--sort-by-column-name', causing it to run in every
-  ;; tabulated-list buffer, we must make sure it's the pocket-reader
-  ;; buffer.
-  (when (string= "*pocket-reader*" (buffer-name))
-    (run-hooks 'pocket-reader-finalize-hook)))
 
 (defun pocket-reader--get-items (&optional query)
   "Return Pocket items for QUERY.
@@ -790,8 +773,10 @@ QUERY is a string which may contain certain keywords:
                                              (rx (optional ":") "t:")))
          (query-string (s-join " " query-words))
          ;; Get items with query
-         (items (cdr (cl-third (pocket-lib-get :detail-type "complete" :count count :offset pocket-reader-offset
-                                 :search query-string :state state :favorite favorite :tag tag)))))
+         (dat (pocket-lib-get
+                :detail-type "complete" :count count :offset pocket-reader-offset
+                :search query-string :state state :favorite favorite :tag tag))
+         (items (alist-get 'list dat)))
     (when (> (length items) 0)
       ;; Empty results return an empty vector, which evaluates non-nil, which isn't useful, so in that case we return nil instead.
       items)))
@@ -817,7 +802,8 @@ action in the Pocket API."
              (title-width (- (window-text-width) 11 2 domain-width 10 1)))
     (when (> domain-width pocket-reader-site-column-max-width)
       (setq domain-width pocket-reader-site-column-max-width))
-    (setq tabulated-list-format (vector (list "Added" 10 pocket-reader-added-column-sort-function)
+    (setq tabulated-list-format (vector (list "A" 1 t)
+                                        (list "Added" 10 pocket-reader-added-column-sort-function)
                                         (list "*" 1 t)
                                         (list "Title" title-width t)
                                         (list "Site" domain-width t)
@@ -895,7 +881,7 @@ no spacers will be inserted. "
   (when (apply #'pocket-lib-archive items)
     (--map (pocket-reader--at-item it
              (pocket-reader--set-property 'status "1")
-             (pocket-reader--apply-faces-to-line))
+             (tabulated-list-set-col 0 "✓" t))
            items)))
 
 (defun pocket-reader--readd-items (&rest items)
@@ -903,7 +889,7 @@ no spacers will be inserted. "
   (when (apply #'pocket-lib-readd items)
     (--map (pocket-reader--at-item it
              (pocket-reader--set-property 'status "0")
-             (pocket-reader--apply-faces-to-line))
+             (tabulated-list-set-col 0 "+" t))
            items)))
 
 (defun pocket-reader--is-archived ()
@@ -917,7 +903,7 @@ no spacers will be inserted. "
   (when (apply #'pocket-lib-favorite items)
     (--map (pocket-reader--at-item it
              (pocket-reader--set-property 'favorite "1")
-             (pocket-reader--update-favorite-display t))
+             (pocket-reader--update-favorite-display))
            items)))
 
 (defun pocket-reader--unfavorite-items (&rest items)
@@ -925,16 +911,18 @@ no spacers will be inserted. "
   (when (apply #'pocket-lib-unfavorite items)
     (--map (pocket-reader--at-item it
              (pocket-reader--set-property 'favorite "0")
-             (pocket-reader--update-favorite-display nil))
+             (pocket-reader--update-favorite-display))
            items)))
 
-(defun pocket-reader--is-favorite ()
+(defun pocket-reader--is-favorite (&optional val)
   "Return non-nil if current item is a favorite."
-  (string= "1" (pocket-reader--get-property 'favorite)))
+  (unless val
+    (setq val (pocket-reader--get-property 'favorite)))
+  (string= "1" val))
 
-(defun pocket-reader--update-favorite-display (is-favorite)
+(defun pocket-reader--update-favorite-display ()
   "Update favorite star for current item, depending on value of IS-FAVORITE."
-  (tabulated-list-set-col 1 (if is-favorite "*" "") t)
+  (tabulated-list-set-col (1+ 1) (pocket-reader--favorite-string) t)
   (pocket-reader--apply-faces-to-line))
 
 ;;;;;; Tags
@@ -972,7 +960,8 @@ deduplicated."
   (let* ((tags (-sort #'string< (-uniq tags))))
     (pocket-reader--set-property 'tags tags)
     (pocket-reader--set-tags-column)
-    (pocket-reader--apply-faces-to-line)))
+    ;;(pocket-reader--apply-faces-to-line)
+    ))
 
 (defun pocket-reader--set-tags-column ()
   "Set tags column for current entry.
@@ -1092,11 +1081,13 @@ and compare them with `string='."
 
 ;;;;;; Strings
 
-(defun pocket-reader--favorite-string (val)
+(defun pocket-reader--favorite-string (&optional val)
   "If VAL is 1, return the star character as a string, otherwise the empty string."
-  (pcase val
-    ("0" "")
-    ("1" "*")))
+  (unless val
+    (setq val (pocket-reader--get-property 'favorite)))
+  (if (pocket-reader--is-favorite val)
+      #("*" 0 1 (face pocket-reader-favorite-star))
+    ""))
 
 (defun pocket-reader--wrap-string (string length)
   "Wrap STRING to LENGTH."
@@ -1125,55 +1116,20 @@ and compare them with `string='."
 
 ;;;;;; Faces
 
-(defun pocket-reader--apply-faces ()
-  "Apply faces to buffer."
-  ;; TODO: Maybe we should use a custom print function but this is simpler
-  (pocket-reader--with-pocket-reader-buffer
-    (save-excursion
-      (goto-char (point-min))
-      (while (not (eobp))
-        (pocket-reader--apply-faces-to-line)
-        (forward-line 1))
-      (goto-char (point-min)))))
-
 (defun pocket-reader--apply-faces-to-line ()
   "Apply faces to current line."
   (pocket-reader--with-pocket-reader-buffer
-    (add-text-properties (line-beginning-position) (line-end-position)
-                         (list 'face (pcase (pocket-reader--get-property 'status)
-                                       ("0" 'pocket-reader-unread)
-                                       ("1" 'pocket-reader-archived)) ))
-    (when (pocket-reader--get-property 'favorite)
-      (pocket-reader--set-column-face "*" 'pocket-reader-favorite-star))
-    (when (or pocket-reader-color-site
-              pocket-reader-color-title)
-      (pocket-reader--set-site-face))))
-
-(defun pocket-reader--set-site-face ()
-  "Apply colored face to site column for current entry."
-  (let* ((column (tabulated-list--column-number "Site"))
-         (site (elt (tabulated-list-get-entry) column))
-         (hash (rainbow-identifiers--hash-function site))
-         (face (rainbow-identifiers-cie-l*a*b*-choose-face hash)))
-    (when pocket-reader-color-site
-      (pocket-reader--set-column-face "Site" face))
-    (when pocket-reader-color-title
-      (pocket-reader--set-column-face "Title" face))))
-
-(defun pocket-reader--set-column-face (column face)
-  "Apply FACE to COLUMN on current line.
-COLUMN may be the column name or number."
-  (-let* (((num start _end width) (pocket-reader--column-data column))
-          ;; Convert column positions to buffer positions
-          (start (+ (line-beginning-position) start))
-          (end (+ start width (1- num)))
-          ;; If the last column of the last item is empty or shorter
-          ;; than the column width, this will probably give an
-          ;; args-out-of-range error, so don't try to go past the end
-          ;; of the buffer.
-          (end (min end (point-max))))
-    (pocket-reader--with-pocket-reader-buffer
-      (add-face-text-property start end face t))))
+    (let ((face (if (pocket-reader--is-archived)
+                    'pocket-reader-archived
+                  'pocket-reader-unread)))
+      (add-text-properties (line-beginning-position) (line-end-position)
+                           (list 'face face)))
+    ;; (when (pocket-reader--get-property 'favorite)
+    ;;   (pocket-reader--set-column-face "*" 'pocket-reader-favorite-star))
+    ;; (when (or pocket-reader-color-site
+    ;;           pocket-reader-color-title)
+    ;;   (pocket-reader--set-site-face))
+    ))
 
 (defun pocket-reader--column-data (column)
   "Return data about COLUMN.
